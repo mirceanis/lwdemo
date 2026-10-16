@@ -4,13 +4,12 @@
   "version": "1.0.0",
   "description": "",
   "type": "module",
-  "module": "dist/client.js",
   "scripts": {
     "bootstrap": "hyperdht --bootstrap --host 127.0.0.1 --port 30001",
-    "client": "tsx src/client.ts",
-    "service": "tsx src/service.ts",
-    "build": "tsc",
-    "format": "pnpm dlx prettier --write ."
+    "client": "bare src/client.ts",
+    "service": "bare src/service.ts",
+    "check": "tsc --noEmit",
+    "format": "npx prettier --write ."
   },
   "keywords": [],
   "author": "",
@@ -19,6 +18,9 @@
     "@hyperswarm/rpc": "^3.5.0",
     "autobee": "^2.12.1",
     "b4a": "^1.9.0",
+    "bare-process": "^4.5.1",
+    "bare-readline": "^1.3.1",
+    "bare-stdio": "^1.0.3",
     "compact-encoding": "^3.5.2",
     "corestore": "^7.14.0",
     "hypercore-crypto": "^3.7.0",
@@ -27,14 +29,6 @@
     "hyperswarm": "^4.17.2",
     "protomux-rpc": "^1.10.1"
   },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "12.10.1",
-      "onFail": "download"
-    }
-  },
-  "packageManager": "pnpm@12.10.1",
   "devDependencies": {
     "@types/node": "^26.6.4",
     "tsx": "^4.23.15",

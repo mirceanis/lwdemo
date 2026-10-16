@@ -7,6 +7,7 @@
 //   - joins a *service* swarm topic so a room can discover it and replicate its light-writer core,
 //   - doesn't care about the "room" ingesting its output
 
+import process from "bare-process";
 import * as b4a from "b4a";
 import * as hc from "hypercore-crypto";
 import Hyperswarm from "hyperswarm";
@@ -14,12 +15,12 @@ import HyperDHT, { type Connection } from "hyperdht";
 import Corestore from "corestore";
 import ProtomuxRPC from "protomux-rpc";
 import * as c from "compact-encoding";
-import { LightWriter } from "./light-writer.js";
+import { LightWriter } from "./light-writer";
 import {
   createMessage,
   encode as encodeMessage,
   type Message,
-} from "./message.js";
+} from "./message";
 
 // A service topic (distinct from the chat topic). Both the service and an
 // inviting client compute the same 32 bytes, so they discover each other.

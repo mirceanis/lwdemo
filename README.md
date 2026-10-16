@@ -22,11 +22,11 @@ blocks are ingested and folded into the room as `price bot: <price>` lines.
 ## Running
 
 ```bash
-pnpm install
-pnpm run bootstrap            # local HyperDHT bootstrap on 127.0.0.1:30001
-pnpm run client alice         # in one terminal
-pnpm run client bob           # in another terminal
-pnpm run service              # the price service in another terminal
+npm install
+npm run bootstrap            # local HyperDHT bootstrap on 127.0.0.1:30001
+npm run client alice         # in another terminal
+npm run client bob           # in another terminal
+npm run service              # the price service in another terminal
 ```
 
 Two clients discover each other, form the room, and exchange messages. In any client, type `!service` to invite the

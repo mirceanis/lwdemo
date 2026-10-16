@@ -4,8 +4,8 @@
     "lib": ["ES2024"],
     "types": ["node"],
 
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "module": "es2022",
+    "moduleResolution": "bundler",
 
     "strict": true,
     "erasableSyntaxOnly": true,
@@ -18,5 +18,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "src/**/*.mts", "src/**/*.cts"]
+  "include": [
+    "src/**/*.ts"
+  ]
 }

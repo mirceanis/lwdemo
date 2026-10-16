@@ -1,4 +1,5 @@
-import { createInterface } from "node:readline";
+import { createInterface } from "bare-readline";
+import process from "bare-process";
 
 import * as b4a from "b4a";
 import * as hc from "hypercore-crypto";
@@ -9,7 +10,7 @@ import Hyperswarm from "hyperswarm";
 import HyperDHT, { type Connection } from "hyperdht";
 import Autobee from "autobee";
 import ProtomuxRPC from "protomux-rpc";
-import { dispatch as rpcDispatch } from "./message.js";
+import { dispatch as rpcDispatch } from "./message";
 
 const CHAT_TOPIC = hc.hash(b4a.from("chat"));
 const BOOTSTRAP = [{ host: "127.0.0.1", port: 30001 }];
@@ -298,7 +299,7 @@ export async function run(username: string) {
   await serviceSwarm.listen();
 
   // interactive stdin: each Enter -> room.append(...)
-  const rl = createInterface({ input: process.stdin });
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
   rl.on("line", (line) => {
     const text = line.trim();
     if (!text) return;
@@ -328,7 +329,7 @@ export async function run(username: string) {
 
 const username = process.argv[2];
 if (!username) {
-  console.error("usage: tsx src/cli.ts <username>");
+  console.error("usage: bare src/client.ts <username>");
   process.exit(1);
 }
 
