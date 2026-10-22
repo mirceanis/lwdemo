@@ -18,6 +18,8 @@ export const decodeChat = (buf: Uint8Array): ChatMessage =>
 
 /** Record a line in the room's view. Called from apply(). */
 export async function putLine(view: Hyperbee, m: ChatMessage) {
+  // lines are keyed by timestamp
+  while (await view.get(c.encode(c.uint64, m.timestamp))) m.timestamp++;
   const w = view.write();
   w.tryPut(c.encode(c.uint64, m.timestamp), encodeChat(m));
   await w.flush();

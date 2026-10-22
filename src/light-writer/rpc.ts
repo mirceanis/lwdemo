@@ -11,8 +11,14 @@
 //
 // The vocabulary is shared, what to do with a message is not: the writer only sends, and every
 // reader brings its own handlers.
+//
+// A writer is a one-way channel. A call that is answered is two writers, one each way, with a
+// vocabulary each: the caller's writer carries the requests, the callee's carries the replies, and the
+// same position in both lists is the same method. The request names where its answer goes, in `auth`
+// (an address the callee echoes), because a callee's writer can be read by many.
 
 import * as c from "compact-encoding";
+import * as hc from "hypercore-crypto";
 import type { AutobeeNode } from "autobee";
 import type { LightWriter } from "./light-writer";
 
@@ -30,37 +36,42 @@ export interface Message<T = any> {
 
 export const PLAINTEXT = 0;
 
+export interface Header {
+  /** Random, so unique across writers: a message can be referred to by it. */
+  id: Uint8Array;
+  /** The message's position in the list. */
+  method: number;
+  /** The payload's encryption scheme (see PLAINTEXT). */
+  encryption: number;
+  /**
+   * Opaque to the library. A service reads it to accept or reject a request; whoever made it reads it
+   * back. A callee that answers copies the request's onto its reply, so it is not for secrets.
+   */
+  auth: Uint8Array | null;
+}
+
 export interface Envelope {
-  header: {
-    /** The writer's length when the message was appended: unique per writer. */
-    id: number;
-    /** The message's position in the list. */
-    method: number;
-    /** The payload's encryption scheme (see PLAINTEXT). */
-    encryption: number;
-    /** For authenticated services. */
-    auth: Uint8Array | null;
-  };
+  header: Header;
   payload: Uint8Array;
 }
 
 const envelope: c.Encoder<Envelope> = {
   preencode(state, m) {
-    c.uint.preencode(state, m.header.id);
+    c.fixed16.preencode(state, m.header.id);
     c.uint.preencode(state, m.header.method);
     c.uint.preencode(state, m.header.encryption);
     c.optionalBuffer.preencode(state, m.header.auth);
     c.buffer.preencode(state, m.payload);
   },
   encode(state, m) {
-    c.uint.encode(state, m.header.id);
+    c.fixed16.encode(state, m.header.id);
     c.uint.encode(state, m.header.method);
     c.uint.encode(state, m.header.encryption);
     c.optionalBuffer.encode(state, m.header.auth);
     c.buffer.encode(state, m.payload);
   },
   decode(state) {
-    const id = c.uint.decode(state);
+    const id = c.fixed16.decode(state);
     const method = c.uint.decode(state);
     const encryption = c.uint.decode(state);
     const auth = c.optionalBuffer.decode(state);
@@ -76,45 +87,46 @@ export const decodeEnvelope = (buf: Uint8Array) => c.decode(envelope, buf);
 // Writer side
 // ---------------------------------------------------------------------------
 
+/** What a sender can put in a message's header besides what it must. */
+export interface SendOptions {
+  /** Plaintext, so a callee can accept, reject or route a message without reading the payload. */
+  auth?: Uint8Array;
+}
+
 export interface RpcMethod<T = any> {
   /** The wire id. */
   readonly method: number;
   readonly name: string;
-  /** Resolves to the writer's new length. */
-  send(value: T): Promise<number>;
+  /** Resolves to the writer's new length. `opts` override the writer's defaults for this message. */
+  send(value: T, opts?: SendOptions): Promise<number>;
 }
 
 /**
- * One sender per writer: a message's id is the writer's length when it is appended, which is
- * unique, and sends are serialized to keep it that way.
+ * Typed sends on a writer. Each message gets a random id, so sends need no coordination: they can
+ * run concurrently, and several senders can share a writer. `defaults` go in the header of every
+ * message the writer sends (a caller's writer is made for one reply address, carried in `auth`).
  */
 export function createRpc(
   writer: LightWriter,
   messages: (Message | null)[],
+  defaults: SendOptions = {},
 ): RpcMethod[] {
-  let queue: Promise<unknown> = Promise.resolve();
-
-  function send(method: number, payload: Uint8Array): Promise<number> {
-    const task = queue.then(async () => {
-      await writer.ready();
-      const header = {
-        id: writer.length,
-        method,
-        encryption: PLAINTEXT,
-        auth: null,
-      };
-      return writer.append(encodeEnvelope({ header, payload }));
-    });
-    queue = task.catch(() => {});
-    return task;
-  }
+  const send = (method: number, payload: Uint8Array, opts: SendOptions) => {
+    const header: Header = {
+      id: hc.randomBytes(16),
+      method,
+      encryption: PLAINTEXT,
+      auth: opts.auth ?? defaults.auth ?? null,
+    };
+    return writer.append(encodeEnvelope({ header, payload }));
+  };
 
   return messages.map((m, method) => ({
     method,
     name: m?.name ?? "(retired)",
-    send: (value: unknown) =>
+    send: (value: unknown, opts: SendOptions = {}) =>
       m
-        ? send(method, c.encode(m.encoding, value))
+        ? send(method, c.encode(m.encoding, value), opts)
         : Promise.reject(new Error(`message ${method} is retired`)),
   }));
 }
@@ -123,10 +135,18 @@ export function createRpc(
 // Reader side
 // ---------------------------------------------------------------------------
 
-/** What a reader makes of each message, by message name. */
+/**
+ * What a reader makes of each message, by message name. The header comes with the value: a reader
+ * that answers needs `auth`, and one that is not the addressee can tell. A handler can decline a
+ * message it was given by returning `undefined`, as it can for one it was not.
+ */
 export type Handlers<R> = Record<
   string,
-  (value: any, node: AutobeeNode) => R | Promise<R>
+  (
+    value: any,
+    node: AutobeeNode,
+    header: Header,
+  ) => R | undefined | Promise<R | undefined>
 >;
 
 /**
@@ -134,8 +154,8 @@ export type Handlers<R> = Record<
  * handler returned. A handler runs inside the reader's apply(), which can be re-run after a reorg,
  * so it only returns what to record and does nothing itself.
  *
- * Anything it can't or won't read (unknown or retired method, no handler for it, encrypted,
- * malformed) gives `undefined`: the writer is an outside party, and apply must not throw.
+ * Anything it can't or won't read gives `undefined`: the writer is an outside party, and
+ * apply must not throw.
  */
 export function routeMessages<R>(
   messages: (Message | null)[],
@@ -167,6 +187,10 @@ export function routeMessages<R>(
     } catch {
       return undefined;
     }
-    return handlers[m.name](value, node);
+    try {
+      return await handlers[m.name](value, node, env.header);
+    } catch {
+      return undefined;
+    }
   };
 }

@@ -206,6 +206,19 @@ declare module "autobee" {
     createReadStream(
       options?: object,
     ): AsyncIterable<{ key: Uint8Array; value: Uint8Array | null }>;
+    /**
+     * Walk this tree (`left`) and `right` in step, yielding only where they differ: an entry in
+     * `left` alone was added here, in `right` alone was removed here, in both with different values
+     * changed. `right` is another tree, e.g. an earlier {@link Hyperbee.snapshot} of this one, or
+     * `checkout({ length: 0 })` for the empty tree.
+     */
+    createDiffStream(
+      right: Hyperbee,
+      options?: object,
+    ): AsyncIterable<{
+      left: { key: Uint8Array; value: Uint8Array | null } | null;
+      right: { key: Uint8Array; value: Uint8Array | null } | null;
+    }>;
     /** Begin a write batch (throws on a non-writable bee). */
     write(opts?: object): BeeBatchWriter;
     /** Open a checkout (a bee pinned to a specific core/length). */

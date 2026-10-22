@@ -11,8 +11,10 @@ import HyperDHT, { type Connection } from "hyperdht";
 import Autobee from "autobee";
 import ProtomuxRPC from "protomux-rpc";
 import { decodeChat, encodeChat, putLine, type ChatMessage } from "./chat";
-import * as service from "./price-service"; // where to find the service
-import * as feed from "./price-feed"; // how the room takes its feed in
+import * as priceService from "./price-service"; // where to find the price service
+import * as priceFeed from "./price-feed"; // how the room takes its feed in
+import * as weatherService from "./weather-service"; // where to find the weather service, how to ask it
+import * as weatherFeed from "./weather-feed"; // how the room takes its answers in
 
 const CHAT_TOPIC = hc.hash(b4a.from("chat"));
 const BOOTSTRAP = [{ host: "127.0.0.1", port: 30001 }];
@@ -53,11 +55,19 @@ let forming = false;
 // Every connection we can replicate the room over once it exists.
 const conns = new Set<Connection>();
 
-let serviceSwarm: InstanceType<typeof Hyperswarm> | null = null;
-// Set by `!service`; the next service connection delivers its key, which we invite.
-let pendingInvite = false;
-// The price service key this peer is following
-let followed: string | null = null;
+type Swarm = InstanceType<typeof Hyperswarm>;
+
+// One swarm per service, so every connection on it is to that service. Each has its own DHT node.
+let priceSwarm: Swarm | null = null;
+let weatherSwarm: Swarm | null = null;
+// Set by `!service` / `!weather`; the next connection to that service delivers its key, which we invite.
+let pendingPriceInvite = false;
+let pendingWeatherInvite = false;
+// The services' keys this peer is following
+let followedPrice: string | null = null;
+let followedWeather: string | null = null;
+// How this peer asks the weather service: a light writer in its own store, for this room's reply address.
+let weatherClient: Promise<weatherService.WeatherClient> | null = null;
 
 // Form the room (join if roomKey is given, bootstrap if null), then replicate
 // it over every connection we already have.
@@ -75,9 +85,10 @@ async function formRoom(roomKey: Uint8Array | null) {
     room = new Autobee(store, roomKey, {
       name: "chat",
       async apply(nodes, view, host) {
-        // The price service's feed first: process() takes its nodes (and its invitation) in and
+        // The services' feeds first: process() takes a service's nodes (and its invitation) in and
         // hands back the room's own appends.
-        nodes = await feed.process(nodes, view);
+        nodes = await priceFeed.process(nodes, view);
+        nodes = await weatherFeed.process(nodes, view, host.key as Uint8Array);
         // .. other services' feeds
 
         // The room's own logic: chat lines.
@@ -98,7 +109,8 @@ async function formRoom(roomKey: Uint8Array | null) {
       async update() {
         if (room) {
           printFromView(room);
-          await followService(room);
+          await followPrice(room);
+          await followWeather(room);
         }
       },
     });
@@ -106,9 +118,10 @@ async function formRoom(roomKey: Uint8Array | null) {
     await printFromView(room); // full history, read from the view
     // Kick the follow once here, not just from update(): on a restart the view is
     // already rebuilt from the log (so the service key is present), but update() won't
-    // fire until a node is applied. Without this, followService never runs until
+    // fire until a node is applied. Without this, followPrice never runs until
     // someone writes.
-    await followService(room);
+    await followPrice(room);
+    await followWeather(room);
     replicateAll();
   } finally {
     forming = false;
@@ -132,15 +145,85 @@ function replicateAll() {
 // Every peer: once the room's view names a price service, find it on its topic and wake the room
 // up on its light-writer core, once. Autobee then follows the core by itself (measured: polling
 // wakeup() every second only added ~1 s of latency).
-async function followService(room: Autobee) {
-  const key = await feed.serviceKey(room.view);
+async function followPrice(room: Autobee) {
+  const key = await priceFeed.serviceKey(room.view);
   if (!key) return;
   const id = b4a.toString(key, "hex");
-  if (followed === id) return;
-  followed = id;
+  if (followedPrice === id) return;
+  followedPrice = id;
   console.log(`following price service ${id}`);
-  serviceSwarm?.join(service.topic, { server: false, client: true });
+  priceSwarm?.join(priceService.topic, { server: false, client: true });
   room.wakeup({ key, length: 0 }).catch(() => {});
+}
+
+// The same for the weather service, whose light writer carries the answers to the room. Every peer
+// also gets ready to ask it (below), since any peer can.
+async function followWeather(room: Autobee) {
+  const key = await weatherFeed.serviceKey(room.view);
+  if (!key) return;
+  const id = b4a.toString(key, "hex");
+  if (followedWeather === id) return;
+  followedWeather = id;
+  console.log(`following weather service ${id}`);
+  await joinWeather(room);
+  room.wakeup({ key, length: 0 }).catch(() => {});
+}
+
+// Look for the weather service on its topic and return this peer's way of asking it. The light
+// writer exists before the first connection, because that is the connection that pairs it (see
+// pairWeather).
+async function joinWeather(room: Autobee) {
+  weatherClient ??= weatherService.WeatherClient.from(store!, {
+    replyTo: weatherFeed.replyAddress(room.key as Uint8Array),
+  });
+  const client = await weatherClient;
+  weatherSwarm?.join(weatherService.topic, { server: false, client: true });
+  return client;
+}
+
+// On every connection to the weather service: tell it which light writer is mine, so that it reads my
+// requests, and learn which one is its own. The first connection after `!weather` also invites it.
+async function pairWeather(conn: Connection) {
+  if (!room || !weatherClient) return;
+  try {
+    const key = await weatherService.pair(conn, (await weatherClient).key);
+    if (pendingWeatherInvite) {
+      pendingWeatherInvite = false;
+      await weatherFeed.invite(room, key);
+      console.log(`invited weather service ${b4a.toString(key, "hex")}`);
+    }
+  } catch (err) {
+    console.error("pairing with the weather service failed", err);
+  }
+}
+
+// `!weather <method> <lat> <lon>`: ask the weather service. The request goes to this peer's own light
+// writer, and the answer comes back to the room, for everyone, as a line.
+const METHODS = {
+  time: "getTime",
+  temperature: "getTemperature",
+  uv: "getUVIndex",
+  wind: "getWind",
+  cloud: "getCloudCoverage",
+} as const;
+
+async function askWeather(room: Autobee, text: string) {
+  const [, what, lat, lon] = text.split(/\s+/);
+  const method = METHODS[what as keyof typeof METHODS];
+  if (!method || !isFinite(+lat) || !isFinite(+lon)) {
+    console.error(
+      `usage: !weather <${Object.keys(METHODS).join("|")}> <lat> <lon>`,
+    );
+    return;
+  }
+  if (!(await weatherFeed.serviceKey(room.view))) {
+    console.error(
+      "the room has not invited the weather service: type !weather",
+    );
+    return;
+  }
+  const client = await joinWeather(room);
+  await client[method]({ lat: +lat, lon: +lon });
 }
 
 let myKey = b4a.alloc(0);
@@ -207,22 +290,33 @@ export async function run(username: string) {
   myKey = swarm.keyPair.publicKey;
   swarm.join(CHAT_TOPIC, { server: true, client: true });
 
-  // the service swarm: replicate the room over each service connection (it
-  // carries the service's light-writer core once it is open here), and answer an
-  // armed invite with the service's key.
-  const serviceDht = new HyperDHT({ bootstrap: BOOTSTRAP, firewalled: false });
-  serviceSwarm = new Hyperswarm({ dht: serviceDht });
-  serviceSwarm.on("connection", (conn: Connection) => {
-    if (room) {
-      try {
-        room.replicate(conn);
-      } catch (err) {
-        console.error("service: replicate failed", err);
+  // One swarm per service: replicate the room's store over each service connection (it carries
+  // the service's light-writer core once it is open here, and this peer's own light writers), and
+  // answer an armed invite with the service's key.
+  const openServiceSwarm = async (onConnection: (conn: Connection) => void) => {
+    const serviceDht = new HyperDHT({
+      bootstrap: BOOTSTRAP,
+      firewalled: false,
+    });
+    const swarm = new Hyperswarm({ dht: serviceDht });
+    swarm.on("connection", (conn: Connection) => {
+      if (room) {
+        try {
+          room.replicate(conn);
+        } catch (err) {
+          console.error("service: replicate failed", err);
+        }
       }
-    }
-    if (pendingInvite && room) {
-      pendingInvite = false;
-      feed
+      onConnection(conn);
+    });
+    await swarm.listen();
+    return swarm;
+  };
+
+  priceSwarm = await openServiceSwarm((conn) => {
+    if (pendingPriceInvite && room) {
+      pendingPriceInvite = false;
+      priceFeed
         .invite(conn, room)
         .then((key) =>
           console.log(`invited price service ${b4a.toString(key, "hex")}`),
@@ -230,7 +324,7 @@ export async function run(username: string) {
         .catch((err) => console.error("invite failed", err));
     }
   });
-  await serviceSwarm.listen();
+  weatherSwarm = await openServiceSwarm((conn) => void pairWeather(conn));
 
   // interactive stdin: each Enter -> room.append(...)
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -242,13 +336,26 @@ export async function run(username: string) {
       return;
     }
     // `!service` invites the price service: look for it on its topic. The
-    // first service connection answers with its key (see inviteService).
+    // first service connection answers with its key (see priceFeed.invite).
     if (text === "!service") {
       console.log(
         "inviting the price service - looking for it on the service topic",
       );
-      pendingInvite = true;
-      serviceSwarm?.join(service.topic, { server: false, client: true });
+      pendingPriceInvite = true;
+      priceSwarm?.join(priceService.topic, { server: false, client: true });
+      return;
+    }
+    // `!weather` invites the weather service, the same way. With a method and a place it asks it.
+    if (text === "!weather") {
+      console.log(
+        "inviting the weather service - looking for it on the weather topic",
+      );
+      pendingWeatherInvite = true;
+      joinWeather(room).catch((err) => console.error(err));
+      return;
+    }
+    if (text.startsWith("!weather ")) {
+      askWeather(room, text).catch((err) => console.error(err));
       return;
     }
     const msg: ChatMessage = { name: username, text, timestamp: Date.now() };

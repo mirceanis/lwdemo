@@ -8,6 +8,7 @@
     "bootstrap": "hyperdht --bootstrap --host 127.0.0.1 --port 30001",
     "client": "bare src/app/client.ts",
     "service": "bare src/app/price-service.ts",
+    "weather": "bare src/app/weather-service.ts",
     "check": "tsc --noEmit",
     "format": "npx prettier --write ."
   },
