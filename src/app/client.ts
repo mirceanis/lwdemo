@@ -10,58 +10,35 @@ import Hyperswarm from "hyperswarm";
 import HyperDHT, { type Connection } from "hyperdht";
 import Autobee from "autobee";
 import ProtomuxRPC from "protomux-rpc";
-import { dispatch as rpcDispatch } from "./message";
+import { decodeChat, encodeChat, putLine, type ChatMessage } from "./chat";
+import * as service from "./price-service"; // where to find the service
+import * as feed from "./price-feed"; // how the room takes its feed in
 
 const CHAT_TOPIC = hc.hash(b4a.from("chat"));
 const BOOTSTRAP = [{ host: "127.0.0.1", port: 30001 }];
 const HANDSHAKE = b4a.from("simple-chat");
 
-// The bot service: it announces on its own topic
-// and hands out its light-writer key over a ProtomuxRPC request.
-const SERVICE_TOPIC = hc.hash(b4a.from("service"));
-const SERVICE_HANDSHAKE = b4a.from("feeder-service");
-const SERVICE_KEY_METHOD = "serviceKey";
-// The fixed view key that holds the invited service's light-writer key. (regular chat keys are 8 bytes wide)
-const SERVICE_KEY = b4a.from("service");
-
-// Light-writer messages, routed by their plaintext header method.
-const rpcHandlers: Record<string, (payload: Uint8Array) => unknown> = {
-  price: (payload) => b4a.toString(payload, "utf8"),
-};
-
-interface ChatMessage {
-  name: string;
-  text: string;
-  timestamp: number;
-  serviceKey?: string; // gets populated when a service is invited to post to the room
-}
-const encodeChat = (m: ChatMessage): Uint8Array =>
-  Buffer.from(JSON.stringify(m), "utf8");
-const decodeChat = (buf: Uint8Array): ChatMessage =>
-  JSON.parse(b4a.toString(buf, "utf8"));
-
 const printed = new Set<number>();
 
-// Read the chat history from the room's view. The view is re-read on every update();
-// `printed` dedups messages.
+// Read the chat history from the room's view. The view is re-read on every update(); `printed`
+// dedups messages.
 async function printFromView(room: Autobee) {
   const pending: ChatMessage[] = [];
   for await (const entry of room.view.createReadStream()) {
-    if (!entry.value) continue;
-    if (b4a.equals(entry.key, SERVICE_KEY)) continue; // the service key, not a chat line
+    // chat lines have an 8-byte key; anything else in the view is a service's state
+    if (!entry.value || entry.key.byteLength !== 8) continue;
     let m: ChatMessage;
     try {
       m = decodeChat(entry.value);
     } catch {
       continue; // not a chat line; skip
     }
-    if (m.serviceKey) continue; // an invitation, not a chat line
-    if (printed.has(m.timestamp)) continue;
     pending.push(m);
   }
   // prints oldest-first.
   pending.sort((a, b) => a.timestamp - b.timestamp);
   for (const m of pending) {
+    if (printed.has(m.timestamp)) continue;
     console.log(`${m.name}: ${m.text}`);
     printed.add(m.timestamp);
   }
@@ -79,7 +56,7 @@ const conns = new Set<Connection>();
 let serviceSwarm: InstanceType<typeof Hyperswarm> | null = null;
 // Set by `!service`; the next service connection delivers its key, which we invite.
 let pendingInvite = false;
-// The service key this peer is following
+// The price service key this peer is following
 let followed: string | null = null;
 
 // Form the room (join if roomKey is given, bootstrap if null), then replicate
@@ -98,44 +75,22 @@ async function formRoom(roomKey: Uint8Array | null) {
     room = new Autobee(store, roomKey, {
       name: "chat",
       async apply(nodes, view, host) {
+        // The price service's feed first: process() takes its nodes (and its invitation) in and
+        // hands back the room's own appends.
+        nodes = await feed.process(nodes, view);
+        // .. other services' feeds
+
+        // The room's own logic: chat lines.
         for (const node of nodes) {
-          // A light-writer input from the invited price service: dispatch it by
-          // its header and fold the result into the view as a "price bot" chat
-          // line. It is not admitted as a writer. The service key is read from
-          // the view (built by earlier nodes).
-          const service = await view.get(SERVICE_KEY);
-          if (service && b4a.equals(service.value, node.key)) {
-            if (node.value == null) continue;
-            const value = rpcDispatch(node as any, rpcHandlers);
-            if (value == null) continue;
-            const line: ChatMessage = {
-              name: "price bot",
-              text: String(value),
-              timestamp: node.timestamp,
-            };
-            const w = view.write();
-            w.tryPut(c.encode(c.uint64, node.timestamp), encodeChat(line));
-            await w.flush();
-            continue;
-          }
-          // A room append: a chat line, optionally carrying an invitation
-          // (a `serviceKey`). The key is recorded for everyone; the invitation is
-          // not itself a chat line, so it is not printed.
-          await host.addWriter(node.key); // grant every writer that shows up
+          await host.addWriter(node.key); // grant every regular writer that shows up
           if (node.value == null) continue;
           let msg: ChatMessage;
           try {
             msg = decodeChat(node.value);
           } catch {
-            continue; // not a chat line; ignore deterministically
+            continue; // not a chat line (e.g. a service invitation); ignore deterministically
           }
-          const w = view.write();
-          if (msg.serviceKey) {
-            w.tryPut(SERVICE_KEY, b4a.from(msg.serviceKey, "hex"));
-          } else {
-            w.tryPut(c.encode(c.uint64, msg.timestamp), node.value);
-          }
-          await w.flush();
+          await putLine(view, msg);
         }
       },
       // update() is the "something new arrived" hook (fires after apply); read
@@ -150,7 +105,7 @@ async function formRoom(roomKey: Uint8Array | null) {
     await room.ready();
     await printFromView(room); // full history, read from the view
     // Kick the follow once here, not just from update(): on a restart the view is
-    // already rebuilt from the log (so SERVICE_KEY is present), but update() won't
+    // already rebuilt from the log (so the service key is present), but update() won't
     // fire until a node is applied. Without this, followService never runs until
     // someone writes.
     await followService(room);
@@ -174,44 +129,18 @@ function replicateAll() {
   }
 }
 
-// The inviting side of `!service`: ask the service for its light-writer key, then
-// append it to the room as an invitation. The connection here is assumed to be the service bot.
-function inviteService(conn: Connection, username: string) {
-  const rpc = new ProtomuxRPC(conn, { handshake: SERVICE_HANDSHAKE });
-  rpc.on("open", async () => {
-    try {
-      const key = await rpc.request(SERVICE_KEY_METHOD, null, {
-        responseEncoding: c.optionalBuffer,
-      });
-      if (!key || !room) return;
-      const invite: ChatMessage = {
-        name: username,
-        text: "I invited the service to post prices here",
-        timestamp: Date.now(),
-        serviceKey: b4a.toString(key, "hex"),
-      };
-      await room.append(encodeChat(invite), { optimistic: !room.writable });
-      console.log(`invited price service ${b4a.toString(key, "hex")}`);
-    } catch (err) {
-      console.error("invite failed", err);
-    }
-  });
-}
-
-// Every peer: once the room's view names a service, discover it on its topic and
-// keep the room woken on its light-writer core so its prices are ingested.
+// Every peer: once the room's view names a price service, find it on its topic and wake the room
+// up on its light-writer core, once. Autobee then follows the core by itself (measured: polling
+// wakeup() every second only added ~1 s of latency).
 async function followService(room: Autobee) {
-  const entry = await room.view.get(SERVICE_KEY);
-  if (!entry || !entry.value) return;
-  const id = b4a.toString(entry.value, "hex");
+  const key = await feed.serviceKey(room.view);
+  if (!key) return;
+  const id = b4a.toString(key, "hex");
   if (followed === id) return;
   followed = id;
   console.log(`following price service ${id}`);
-  serviceSwarm?.join(SERVICE_TOPIC, { server: false, client: true });
-  const lwKey = entry.value;
-  setInterval(() => {
-    room.wakeup({ key: lwKey, length: 0 }).catch(() => {});
-  }, 1000);
+  serviceSwarm?.join(service.topic, { server: false, client: true });
+  room.wakeup({ key, length: 0 }).catch(() => {});
 }
 
 let myKey = b4a.alloc(0);
@@ -291,9 +220,14 @@ export async function run(username: string) {
         console.error("service: replicate failed", err);
       }
     }
-    if (pendingInvite) {
+    if (pendingInvite && room) {
       pendingInvite = false;
-      inviteService(conn, username);
+      feed
+        .invite(conn, room)
+        .then((key) =>
+          console.log(`invited price service ${b4a.toString(key, "hex")}`),
+        )
+        .catch((err) => console.error("invite failed", err));
     }
   });
   await serviceSwarm.listen();
@@ -314,7 +248,7 @@ export async function run(username: string) {
         "inviting the price service - looking for it on the service topic",
       );
       pendingInvite = true;
-      serviceSwarm?.join(SERVICE_TOPIC, { server: false, client: true });
+      serviceSwarm?.join(service.topic, { server: false, client: true });
       return;
     }
     const msg: ChatMessage = { name: username, text, timestamp: Date.now() };

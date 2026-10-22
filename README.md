@@ -12,12 +12,14 @@ run a one-shot handshake to agree on a single room: if one already has a room it
 DHT-key-smallest peer bootstraps it. The room is an **Autobee**. Chat lines are `room.append`ed and replicated to every peer.
 
 **The service / light-writer.** The price service (`pnpm run service`) is a separate process. It owns its own Corestore
-and a **light writer**, doesn't act as a peer to the chat room. It broadcasts a random-walk price every 3 seconds.
+and a **light writer**, doesn't act as a peer to the chat room, and doesn't know about any room. It broadcasts a
+random-walk price every 3 seconds, and lets clients find it on a topic and ask it for its light-writer key.
 
 A peer subscribes with `!service` in chat. That is itself an **append**: the inviting peer asks the service for its
-light-writer key over a short RPC, then appends that key to the room as an _invitation_. `apply()` records the key in
-the view; every peer then discovers the service on its own topic and `wakeup`s on its light-writer core, so its price
-blocks are ingested and folded into the room as `price bot: <price>` lines.
+light-writer key over a short RPC, then appends that key to the room as an _invitation_. The room's `apply()` hands
+every batch to the room's own `process()` (`price-feed.ts`), which records the key in the view and takes the service's
+light-writer nodes in as `price bot: <price>` lines. Every peer then discovers the service on its own topic and
+`wakeup`s once on its light-writer core.
 
 ## Running
 
